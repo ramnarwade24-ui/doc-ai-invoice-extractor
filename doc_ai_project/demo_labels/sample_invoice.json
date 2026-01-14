@@ -1,0 +1,8 @@
+{
+  "dealer_name": "ABC Tractors Pvt Ltd",
+  "model_name": "Mahindra 575 DI",
+  "horse_power": 50,
+  "asset_cost": 525000,
+  "signature": {"present": false},
+  "stamp": {"present": false}
+}

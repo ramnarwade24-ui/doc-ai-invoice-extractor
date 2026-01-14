@@ -1,0 +1,25 @@
+# Core pipeline
+pymupdf==1.24.14
+pillow==10.4.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+pydantic==2.10.4
+rapidfuzz==3.10.1
+python-json-logger==2.0.7
+
+# OCR (multilingual)
+paddleocr==2.8.1
+paddlepaddle==2.6.2
+
+# Layout primitives (light usage; no heavy detectron2 models required)
+layoutparser==0.3.4
+
+# Optional vision detector (signature/stamp)
+ultralytics==8.3.39
+
+# App + viz + analytics
+streamlit==1.41.1
+matplotlib==3.9.2
+seaborn==0.13.2
+pandas==2.2.3
+networkx==3.4.2

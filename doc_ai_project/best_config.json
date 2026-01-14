@@ -1,0 +1,55 @@
+{
+  "seed": 1337,
+  "deterministic": true,
+  "dpi": 200,
+  "max_pages": 5,
+  "output_dir": "outputs",
+  "eda_dir": "eda_outputs",
+  "ocr_langs": [
+    "en",
+    "devanagari",
+    "gujarati"
+  ],
+  "use_angle_cls": true,
+  "ocr_det": true,
+  "ocr_rec": true,
+  "max_ocr_retries": 1,
+  "ocr_preprocess_variants": [
+    [
+      true,
+      true,
+      true
+    ],
+    [
+      false,
+      true,
+      true
+    ],
+    [
+      true,
+      false,
+      true
+    ]
+  ],
+  "dealer_fuzzy_threshold": 90,
+  "region_weight_overrides": {},
+  "yolo_weights_path": null,
+  "yolo_conf": 0.25,
+  "yolo_iou": 0.5,
+  "yolo_img_sizes": [
+    640
+  ],
+  "leaderboard_weight_dla": 0.7,
+  "leaderboard_weight_latency": 0.2,
+  "leaderboard_weight_cost": 0.1,
+  "leaderboard_latency_target_sec": 30.0,
+  "leaderboard_cost_target_usd": 0.01,
+  "leaderboard_use_latency_p95": true,
+  "submission_min_dla": 0.95,
+  "submission_max_latency_sec": 30.0,
+  "submission_max_cost_usd": 0.01,
+  "save_overlays": true,
+  "cost_per_page_usd_ocr": 0.0006,
+  "cost_per_page_usd_yolo": 0.0003,
+  "cost_per_doc_usd_overhead": 0.0002
+}

@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pt
+*.onnx
+*.bin
+*.model
+outputs/
+data/
+.DS_Store
+.ipynb_checkpoints/
