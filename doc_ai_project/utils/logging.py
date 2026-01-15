@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 from pythonjsonlogger import jsonlogger
 
 
-def get_json_logger(name: str, log_path: Optional[Path] = None) -> logging.Logger:
+def get_json_logger(name: str, log_path: Optional[Path] = None, *, to_stdout: bool = True) -> logging.Logger:
 	logger = logging.getLogger(name)
 	if getattr(logger, "_configured", False):
 		return logger
@@ -20,9 +20,10 @@ def get_json_logger(name: str, log_path: Optional[Path] = None) -> logging.Logge
 		rename_fields={"levelname": "level", "name": "logger"},
 	)
 
-	stream = logging.StreamHandler()
-	stream.setFormatter(formatter)
-	logger.addHandler(stream)
+	if to_stdout:
+		stream = logging.StreamHandler()
+		stream.setFormatter(formatter)
+		logger.addHandler(stream)
 
 	if log_path is not None:
 		log_path.parent.mkdir(parents=True, exist_ok=True)

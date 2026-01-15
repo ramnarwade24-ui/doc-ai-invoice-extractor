@@ -117,7 +117,11 @@ def merge_structured_layouts(layouts: List[StructuredLayout]) -> StructuredLayou
 	Keeps region buckets by concatenating region lines. BBoxes become the union.
 	"""
 	if not layouts:
-		return StructuredLayout(page_index=-1, page_size=(0, 0), regions={}, all_lines=[])
+		# Downstream extraction expects standard region keys to exist.
+		empty_regions: Dict[str, Region] = {}
+		for name in ("header", "body", "table", "footer"):
+			empty_regions[name] = Region(name=name, bbox=(0, 0, 0, 0), confidence=0.0, lines=[], blocks=_Layout([]))
+		return StructuredLayout(page_index=-1, page_size=(0, 0), regions=empty_regions, all_lines=[])
 
 	def union_bbox(bbs: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, int]:
 		bbs = [b for b in bbs if b and b != (0, 0, 0, 0)]

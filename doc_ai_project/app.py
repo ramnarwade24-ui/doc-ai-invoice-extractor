@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
+import tempfile
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -22,7 +27,7 @@ base_dir = Path(__file__).resolve().parent
 work_dir = base_dir / "outputs"
 work_dir.mkdir(parents=True, exist_ok=True)
 
-tab_extract, tab_robust = st.tabs(["Extract", "Robustness"])
+tab_extract, tab_robust, tab_judge = st.tabs(["Extract", "Robustness", "Judge Demo"])
 
 with tab_extract:
 	uploaded = st.file_uploader("Upload an invoice PDF", type=["pdf"], key="extract_upload")
@@ -217,3 +222,228 @@ with tab_robust:
 			)
 
 		st.info(f"Variants saved in: {out_dir}")
+
+
+with tab_judge:
+	st.subheader("Judge Demo")
+	st.caption("Upload a ZIP of PDFs → run deterministic batch extraction → download CSV + summary.")
+
+	# Config picker (default to best_config.json when present)
+	best_cfg = base_dir / "best_config.json"
+	use_best = bool(best_cfg.exists())
+	st.markdown("**Config**")
+	col_cfg1, col_cfg2 = st.columns([2, 3])
+	with col_cfg1:
+		cfg_mode = st.radio(
+			"Config source",
+			options=["Use best_config.json", "Upload config JSON"],
+			index=0 if use_best else 1,
+			horizontal=False,
+			key="judge_cfg_mode",
+		)
+	with col_cfg2:
+		cfg_upload = None
+		if cfg_mode == "Upload config JSON":
+			cfg_upload = st.file_uploader("Upload config JSON", type=["json"], key="judge_cfg_upload")
+		elif not use_best:
+			st.warning("best_config.json not found in doc_ai_project/. Upload a config JSON to run.")
+
+	seed_val = st.number_input("Seed (deterministic)", min_value=0, max_value=2_000_000_000, value=1337, step=1, key="judge_seed")
+
+	zip_up = st.file_uploader("Upload ZIP containing PDFs", type=["zip"], key="judge_zip")
+	run_demo = st.button("Run Judge Demo", type="primary", disabled=zip_up is None, key="judge_run")
+
+	def _sha256_bytes(data: bytes) -> str:
+		h = hashlib.sha256()
+		h.update(data)
+		return h.hexdigest()
+
+	def _rows_to_csv(rows: list[dict]) -> str:
+		if not rows:
+			return ""
+		buf = io.StringIO()
+		w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+		w.writeheader()
+		for r in rows:
+			w.writerow(r)
+		return buf.getvalue()
+
+	if zip_up and run_demo:
+		# Resolve selected config (keep paths relative to doc_ai_project when possible)
+		cfg_name = ""
+		cfg_sha = ""
+		cfg_arg = None
+		if cfg_mode == "Use best_config.json":
+			if not best_cfg.exists():
+				st.error("best_config.json not found. Upload a config JSON.")
+				st.stop()
+			cfg_name = "best_config.json"
+			cfg_bytes = best_cfg.read_bytes()
+			cfg_sha = _sha256_bytes(cfg_bytes)
+			cfg_arg = "best_config.json"
+		else:
+			if cfg_upload is None:
+				st.error("Please upload a config JSON.")
+				st.stop()
+			cfg_name = str(cfg_upload.name)
+			cfg_bytes = cfg_upload.getvalue()
+			cfg_sha = _sha256_bytes(cfg_bytes)
+			# Save under doc_ai_project/outputs/ for reproducibility
+			cfg_dir = work_dir / "judge_demo"
+			cfg_dir.mkdir(parents=True, exist_ok=True)
+			saved_cfg = cfg_dir / "selected_config.json"
+			saved_cfg.write_bytes(cfg_bytes)
+			# Pass relative to doc_ai_project/
+			cfg_arg = str(saved_cfg.relative_to(base_dir))
+
+		st.write({"active_config": cfg_name, "config_sha256": cfg_sha})
+
+		# Extract ZIP to a temporary directory (offline, no hardcoded paths)
+		tmp_dir = Path(tempfile.mkdtemp(prefix="docai_judge_demo_"))
+		try:
+			with zipfile.ZipFile(io.BytesIO(zip_up.getvalue())) as z:
+				z.extractall(tmp_dir)
+		except Exception as e:
+			st.error(f"Invalid ZIP: {e}")
+			st.stop()
+
+		# Run deterministic pipeline on all PDFs found in the ZIP
+		from utils.demo_utils import discover_pdfs, format_table, run_pipeline
+
+		pdfs = discover_pdfs(str(tmp_dir), recursive=True, limit=None, seed=int(seed_val))
+		if not pdfs:
+			st.error("No PDFs found inside the uploaded ZIP.")
+			st.stop()
+
+		with st.status(f"Running pipeline on {len(pdfs)} PDF(s)...", expanded=False):
+			results, errors = run_pipeline(pdfs, config_path=cfg_arg, seed=int(seed_val))
+
+		# Display table (requested columns)
+		cols = [
+			"dealer_name",
+			"model_name",
+			"horse_power",
+			"asset_cost",
+			"signature_present",
+			"stamp_present",
+			"confidence",
+			"processing_time_sec",
+		]
+		view = []
+		for r in results:
+			view.append({
+				"dealer_name": r.get("dealer_name"),
+				"model_name": r.get("model_name"),
+				"hp": r.get("horse_power"),
+				"asset_cost": r.get("asset_cost"),
+				"signature": r.get("signature_present"),
+				"stamp": r.get("stamp_present"),
+				"confidence": r.get("confidence"),
+				"latency": r.get("processing_time_sec"),
+			})
+
+		st.markdown("**Results**")
+		st.dataframe(view, use_container_width=True)
+
+		# Summary metrics + health banner
+		latencies = [float(r.get("processing_time_sec") or 0.0) for r in results]
+		confs = [float(r.get("confidence") or 0.0) for r in results]
+		costs = [float(r.get("cost_estimate_usd") or 0.0) for r in results]
+		avg_latency = float(sum(latencies) / max(1, len(latencies)))
+		avg_conf = float(sum(confs) / max(1, len(confs)))
+		avg_cost = float(sum(costs) / max(1, len(costs)))
+
+		reasons = []
+		schema_ok = bool(len(errors) == 0 and len(results) == len(pdfs))
+		if not schema_ok:
+			reasons.append("schema_validation_failed")
+		if not (avg_latency <= 30.0):
+			reasons.append("avg_latency_gt_30s")
+		if not (avg_cost < 0.01):
+			reasons.append("avg_cost_ge_0.01")
+		ok = bool(len(reasons) == 0)
+		if ok:
+			st.success("PASS: schema OK, avg latency ≤ 30s, avg cost < $0.01")
+		else:
+			st.error("FAIL: " + ", ".join(reasons))
+
+		st.markdown("**Summary**")
+		st.write(
+			{
+				"docs_processed": int(len(results)),
+				"errors": int(len(errors)),
+				"avg_latency_sec": round(avg_latency, 4),
+				"avg_cost_usd": round(avg_cost, 6),
+				"avg_confidence": round(avg_conf, 4),
+				"status": "PASS" if ok else "FAIL",
+				"reasons": reasons,
+			}
+		)
+
+		if errors:
+			st.warning("Some documents failed. See details below.")
+			st.code(json.dumps(errors, ensure_ascii=False, indent=2), language="json")
+
+		# Download artifacts
+		csv_text = _rows_to_csv(
+			[
+				{
+					"dealer_name": r.get("dealer_name"),
+					"model_name": r.get("model_name"),
+					"hp": r.get("horse_power"),
+					"asset_cost": r.get("asset_cost"),
+					"signature": r.get("signature_present"),
+					"stamp": r.get("stamp_present"),
+					"confidence": r.get("confidence"),
+					"latency": r.get("processing_time_sec"),
+				}
+				for r in results
+			]
+		)
+		summary = {
+			"status": "PASS" if ok else "FAIL",
+			"reasons": reasons,
+			"active_config": cfg_name,
+			"config_sha256": cfg_sha,
+			"seed": int(seed_val),
+			"docs_processed": int(len(results)),
+			"errors": int(len(errors)),
+			"avg_latency_sec": avg_latency,
+			"avg_cost_usd": avg_cost,
+			"avg_confidence": avg_conf,
+			"counts": {"ok": int(len(results)), "error": int(len(errors))},
+		}
+		summary_json = json.dumps(summary, ensure_ascii=False, indent=2)
+
+		colA, colB = st.columns(2)
+		with colA:
+			st.download_button(
+				"Download demo_results.csv",
+				data=csv_text,
+				file_name="demo_results.csv",
+				mime="text/csv",
+			)
+		with colB:
+			st.download_button(
+				"Download demo_summary.json",
+				data=summary_json,
+				file_name="demo_summary.json",
+				mime="application/json",
+			)
+
+		# Optional: if a judge report already exists (from judge_mode), offer it as a download.
+		judge_report = (base_dir.parent / "outputs" / "judge_report.json")
+		if judge_report.exists():
+			st.download_button(
+				"Download outputs/judge_report.json",
+				data=judge_report.read_bytes(),
+				file_name="judge_report.json",
+				mime="application/json",
+			)
+
+		# Optional: show a terminal-style table too (nice for copy/paste)
+		with st.expander("Show CLI-style table"):
+			try:
+				st.code(format_table(results), language="text")
+			except Exception:
+				st.info("Table formatting unavailable.")

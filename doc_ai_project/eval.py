@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,44 @@ from utils.scorecard import render_scorecard_png
 
 
 FIELDS = ["dealer_name", "model_name", "horse_power", "asset_cost", "signature", "stamp"]
+
+
+def _repo_root() -> Path:
+	# doc_ai_project/ -> repo root
+	return Path(__file__).resolve().parent.parent
+
+
+def _discover_pdfs(invoices: str | Path, *, repo_root: Path) -> List[Path]:
+	"""Discover PDFs deterministically.
+
+	- If invoices is a directory: scans recursively for *.pdf
+	- If invoices is a file: accepts a single PDF
+	- Otherwise: treats as a glob pattern relative to repo root (supports **)
+	"""
+	inv_str = str(invoices)
+	inv_path = Path(inv_str)
+	resolved = inv_path if inv_path.is_absolute() else (repo_root / inv_path)
+
+	if resolved.exists() and resolved.is_file():
+		return [resolved] if resolved.suffix.lower() == ".pdf" else []
+	if resolved.exists() and resolved.is_dir():
+		return sorted([p for p in resolved.rglob("*.pdf") if p.is_file()])
+
+	# Glob pattern (relative to repo root)
+	return sorted([p for p in repo_root.glob(inv_str) if p.is_file() and p.suffix.lower() == ".pdf"])
+
+
+def _limit_pdfs(pdfs: List[Path], *, limit: Optional[int], seed: int) -> List[Path]:
+	if limit is None:
+		return pdfs
+	k = int(limit)
+	if k <= 0:
+		return []
+	if k >= len(pdfs):
+		return pdfs
+	# deterministic sample from a deterministic ordering
+	rng = random.Random(int(seed))
+	return sorted(rng.sample(pdfs, k=k))
 
 
 def _percentile(values: List[float], p: float) -> float:
@@ -105,6 +144,7 @@ def _compare_field(field: str, pred_fields: Dict[str, Any], gt_fields: Dict[str,
 def evaluate_dataset(
 	*,
 	invoices_dir: Path,
+	pdf_paths: Optional[List[Path]] = None,
 	labels_dir: Optional[Path],
 	config: PipelineConfig,
 	outputs_dir: Path,
@@ -114,7 +154,11 @@ def evaluate_dataset(
 	pred_dir = outputs_dir / "eval_predictions"
 	pred_dir.mkdir(parents=True, exist_ok=True)
 
-	pdfs = sorted([p for p in invoices_dir.glob("*.pdf")])
+	# Support nested folders (evaluator datasets often have structure)
+	if pdf_paths is not None:
+		pdfs = sorted([p for p in pdf_paths if p.is_file() and p.suffix.lower() == ".pdf"])
+	else:
+		pdfs = sorted([p for p in invoices_dir.rglob("*.pdf") if p.is_file()])
 	if not pdfs:
 		raise FileNotFoundError(f"No PDFs found under {invoices_dir}")
 
@@ -234,38 +278,70 @@ def _write_scorecard(outputs_dir: Path, summary: Dict[str, Any]) -> None:
 
 def main() -> int:
 	p = argparse.ArgumentParser(description="Evaluate DocAI invoice extractor")
-	p.add_argument("--invoices", required=True, help="Folder containing invoice PDFs")
+	p.add_argument(
+		"--invoices",
+		default="data/pdfs",
+		help=(
+			"Dataset path for invoice PDFs. Accepts a directory (scans recursively), a single PDF, "
+			"or a glob pattern like data/pdfs/**/*.pdf. Relative paths are resolved from repo root."
+		),
+	)
 	p.add_argument(
 		"--labels",
 		default="",
-		help="Folder containing ground-truth JSON (same stem as PDF). If omitted, accuracy metrics are 0.",
+		help=(
+			"Folder containing ground-truth JSON (same stem as PDF). If omitted, accuracy metrics are 0. "
+			"Relative paths are resolved from repo root."
+		),
 	)
 	p.add_argument("--out", default="outputs/eval_report.json", help="Output eval report JSON")
 	p.add_argument("--dpi", type=int, default=200)
 	p.add_argument("--max-pages", type=int, default=5)
 	p.add_argument("--dealer-threshold", type=int, default=90)
+	p.add_argument(
+		"--limit",
+		type=int,
+		default=None,
+		help="Optional deterministic sample size (useful for quick CPU-only eval runs).",
+	)
+	p.add_argument(
+		"--run-mode",
+		default="normal",
+		choices=("normal", "replay", "tuning", "submission", "judge", "demo"),
+		help="Pipeline run mode (affects logging + some gating).",
+	)
 	p.add_argument("--seed", type=int, default=1337)
 	args = p.parse_args()
 
 	base_dir = Path(__file__).resolve().parent
+	repo_root = _repo_root()
 	outputs_dir = base_dir / "outputs"
 	out_path = (base_dir / args.out) if not Path(args.out).is_absolute() else Path(args.out)
 	out_path.parent.mkdir(parents=True, exist_ok=True)
 
 	labels_dir = Path(args.labels) if args.labels else None
 	if labels_dir is not None and not labels_dir.is_absolute():
-		labels_dir = base_dir / labels_dir
+		labels_dir = repo_root / labels_dir
 
 	cfg = PipelineConfig(
 		seed=args.seed,
 		deterministic=True,
+		run_mode=str(args.run_mode),
 		dpi=args.dpi,
 		max_pages=args.max_pages,
 		dealer_fuzzy_threshold=args.dealer_threshold,
 	)
 
+	invoices = _discover_pdfs(args.invoices, repo_root=repo_root)
+	invoices = _limit_pdfs(invoices, limit=args.limit, seed=int(args.seed))
+	if not invoices:
+		raise FileNotFoundError(
+			"No PDFs found. Provide --invoices as a directory, a single PDF, or a glob pattern. "
+			"Example: --invoices data/pdfs"
+		)
 	report = evaluate_dataset(
-		invoices_dir=Path(args.invoices) if Path(args.invoices).is_absolute() else (base_dir / args.invoices),
+		invoices_dir=repo_root / "data" / "pdfs",
+		pdf_paths=invoices,
 		labels_dir=labels_dir,
 		config=cfg,
 		outputs_dir=outputs_dir,

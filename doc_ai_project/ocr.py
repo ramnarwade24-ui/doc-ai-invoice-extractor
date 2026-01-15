@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional
 
+import os
+
 import numpy as np
 from PIL import Image
 
@@ -42,6 +44,12 @@ class PaddleOCREngine:
 		perspective_correct: bool = False,
 		upscale_if_low_res: bool = True,
 	):
+		# Hard-disable GPU/TensorRT/MKLDNN for safety in headless CPU-only environments.
+		# These env vars must be set before importing paddle/paddleocr.
+		os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+		os.environ.setdefault("FLAGS_use_cuda", "0")
+		os.environ.setdefault("FLAGS_use_mkldnn", "0")
+		os.environ.setdefault("FLAGS_enable_ir_optim", "0")
 		try:
 			from paddleocr import PaddleOCR  # type: ignore
 		except Exception as e:
@@ -67,13 +75,29 @@ class PaddleOCREngine:
 		self._ocr_by_lang = {}
 		for lang in self.langs:
 			try:
-				self._ocr_by_lang[lang] = PaddleOCR(use_angle_cls=use_angle_cls, lang=lang, show_log=False)
+				self._ocr_by_lang[lang] = PaddleOCR(
+					use_angle_cls=use_angle_cls,
+					lang=lang,
+					show_log=False,
+					use_gpu=False,
+					use_tensorrt=False,
+					enable_mkldnn=False,
+					ir_optim=False,
+				)
 			except Exception:
 				# Unsupported lang/model; skip.
 				continue
 		if not self._ocr_by_lang:
 			# Last-resort: english
-			self._ocr_by_lang["en"] = PaddleOCR(use_angle_cls=use_angle_cls, lang="en", show_log=False)
+			self._ocr_by_lang["en"] = PaddleOCR(
+				use_angle_cls=use_angle_cls,
+				lang="en",
+				show_log=False,
+				use_gpu=False,
+				use_tensorrt=False,
+				enable_mkldnn=False,
+				ir_optim=False,
+			)
 
 	@staticmethod
 	def _pil_to_np(image: Image.Image) -> np.ndarray:

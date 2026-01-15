@@ -22,6 +22,79 @@ from utils.text import (
 MONEY_RE = re.compile(r"(?<!\d)(?:\d{1,3}(?:,\d{2,3})+|\d+)(?!\d)")
 
 
+_ADAPTER_CACHE: Dict[str, object] = {}
+
+
+def _load_dataset_adapters(base_dir: Path) -> Dict[str, object]:
+	"""Load dataset adapters JSON if present.
+
+	Expected location: repo-root relative doc_ai_project/outputs/dataset_adapters.json
+	"""
+	key = "dataset_adapters"
+	if key in _ADAPTER_CACHE:
+		return _ADAPTER_CACHE[key]  # type: ignore[return-value]
+	try:
+		repo_root = base_dir.parent
+		path = repo_root / "doc_ai_project" / "outputs" / "dataset_adapters.json"
+		if not path.exists():
+			_ADAPTER_CACHE[key] = {}
+			return {}
+		import json
+
+		obj = json.loads(path.read_text(encoding="utf-8"))
+		if not isinstance(obj, dict):
+			_ADAPTER_CACHE[key] = {}
+			return {}
+		_ADAPTER_CACHE[key] = obj
+		return obj  # type: ignore[return-value]
+	except Exception:
+		_ADAPTER_CACHE[key] = {}
+		return {}
+
+
+def _apply_replacements(text: str, replacements: List[Tuple[str, str]]) -> str:
+	out = text or ""
+	for a, b in replacements:
+		out = out.replace(a, b)
+	return out
+
+
+def _adapt_text(*, base_dir: Path, kind: str, text: str) -> str:
+	ad = _load_dataset_adapters(base_dir)
+	conf = ad.get(kind) if isinstance(ad, dict) else None
+	if not isinstance(conf, dict):
+		return text
+	reps = conf.get("replacements")
+	if isinstance(reps, list):
+		pairs: List[Tuple[str, str]] = []
+		for it in reps:
+			if isinstance(it, list) and len(it) == 2:
+				pairs.append((str(it[0]), str(it[1])))
+			elif isinstance(it, tuple) and len(it) == 2:
+				pairs.append((str(it[0]), str(it[1])))
+			elif isinstance(it, dict) and "from" in it and "to" in it:
+				pairs.append((str(it["from"]), str(it["to"])))
+			elif isinstance(it, (str, int)):
+				# ignore malformed
+				continue
+			else:
+				continue
+			
+		return _apply_replacements(text, pairs)
+	return text
+
+
+MONEY_RELAXED_RE = re.compile(r"(?<!\d)(?:\d[\d,\.\s]{2,}\d|\d+)(?!\d)")
+
+
+def _find_money_numbers(text: str) -> List[str]:
+	"""More tolerant money detection than MONEY_RE for real-world datasets.
+
+	We still parse via digits_only() so separators are safe.
+	"""
+	return MONEY_RELAXED_RE.findall(text or "")
+
+
 @dataclass(frozen=True)
 class FieldCandidate:
 	value: object
@@ -120,6 +193,7 @@ def extract_dealer_name(
 				continue
 			parts = re.split(r"[:\-]", ln.text, maxsplit=1)
 			candidate = normalize_spaces(parts[1] if len(parts) == 2 else ln.text)
+			candidate = _adapt_text(base_dir=base_dir, kind="dealer", text=candidate)
 			m, s = _best_fuzzy_match(candidate, masters)
 			if m and s > best_score:
 				best_val, best_score, best_ln, best_region = m, s, ln, region
@@ -128,7 +202,7 @@ def extract_dealer_name(
 		# Second pass: general fuzzy over region
 		if best_score < threshold:
 			for ln in lines_pref[:80]:
-				m, s = _best_fuzzy_match(ln.text, masters)
+				m, s = _best_fuzzy_match(_adapt_text(base_dir=base_dir, kind="dealer", text=ln.text), masters)
 				if m and s > best_score:
 					best_val, best_score, best_ln, best_region = m, s, ln, region
 					used_fallback = True
@@ -179,8 +253,9 @@ def extract_model_name(
 
 	for region in priorities:
 		for ln in layout.regions[region].lines:
+			line_text = _adapt_text(base_dir=base_dir, kind="model", text=ln.text)
 			for m in models:
-				if normalize_spaces(m).casefold() in ln.text.casefold():
+				if normalize_spaces(m).casefold() in line_text.casefold():
 					ocr_conf = float(ln.avg_conf)
 					rule_conf = 0.98
 					region_conf = _region_weight(region, expected="table", overrides=region_weight_overrides) * float(layout.regions[region].confidence)
@@ -201,11 +276,12 @@ def extract_model_name(
 	label_re = re.compile(r"(?i)\bmodel\b|मॉडल|माडल|मोडल|મોડલ|મોડેલ")
 	for region in priorities:
 		for ln in layout.regions[region].lines:
-			txt = normalize_keywords(ln.text)
+			txt = normalize_keywords(_adapt_text(base_dir=base_dir, kind="model", text=ln.text))
 			if not label_re.search(txt):
 				continue
 			parts = re.split(r"[:\-]", ln.text, maxsplit=1)
 			candidate = normalize_spaces(parts[1] if len(parts) == 2 else "")
+			candidate = _adapt_text(base_dir=base_dir, kind="model", text=candidate)
 			if candidate:
 				ocr_conf = float(ln.avg_conf)
 				rule_conf = 0.55
@@ -270,6 +346,7 @@ def extract_asset_cost(
 	layout: StructuredLayout,
 	region_weight_overrides: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> FieldCandidate:
+	base_dir = Path(__file__).resolve().parent
 	# Prefer footer totals
 	label_re = re.compile(r"(?i)asset\s*cost|invoice\s*amount|grand\s*total|net\s*amount|total\b|amount\b|राशि|कुल|कुल\s*राशि|કુલ|રકમ")
 	regions = ["footer", "table", "body", "header"]
@@ -283,9 +360,9 @@ def extract_asset_cost(
 	for region in regions:
 		for ln in layout.regions[region].lines:
 			# normalize vernacular keywords (helps label matching)
-			norm_line = normalize_keywords(ln.text)
+			norm_line = normalize_keywords(_adapt_text(base_dir=base_dir, kind="price", text=ln.text))
 			txt = strip_currency_tokens(norm_line)
-			nums = MONEY_RE.findall(txt)
+			nums = _find_money_numbers(txt)
 			if not nums:
 				continue
 			vals = [int(digits_only(n) or "0") for n in nums]

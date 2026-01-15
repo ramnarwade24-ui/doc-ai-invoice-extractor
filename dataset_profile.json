@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "dataset": {
+    "pdfs": "data/pdfs",
+    "labels": "data/labels"
+  },
+  "profiles": {
+    "fast": {
+      "description": "Judge-safe profile (CPU-only, deterministic, offline-safe, <30s/doc). Uses PyMuPDF text extraction by default; PaddleOCR remains disabled unless explicitly enabled.",
+      "demo_runner": {
+        "mode": "fast",
+        "enable_paddleocr": false
+      },
+      "judge_mode": {
+        "mode": "fast",
+        "enable_paddleocr": false
+      },
+      "eval": {
+        "dpi": 150,
+        "max_pages": 1
+      }
+    },
+    "accurate": {
+      "description": "Accuracy-oriented profile. Intended for local runs where PaddleOCR models are already present. Use --enable-paddleocr to allow PaddleOCR in submission/judge/demo contexts.",
+      "demo_runner": {
+        "mode": "accurate",
+        "enable_paddleocr": true
+      },
+      "judge_mode": {
+        "mode": "accurate",
+        "enable_paddleocr": true
+      },
+      "eval": {
+        "dpi": 200,
+        "max_pages": 5
+      }
+    }
+  }
+}

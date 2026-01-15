@@ -20,6 +20,7 @@ class PipelineConfig:
 	eda_dir: Path = Path("eda_outputs")
 
 	# OCR
+	enable_paddleocr: bool = False
 	ocr_langs: tuple[str, ...] = ("en", "devanagari", "gujarati")
 	use_angle_cls: bool = True
 	ocr_det: bool = True
