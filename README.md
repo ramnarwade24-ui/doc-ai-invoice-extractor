@@ -1,3 +1,71 @@
+# Doc AI Invoice Extractor
+
+An intelligent Document AI system for multilingual invoice field extraction built for large-scale evaluation and enterprise-grade robustness.
+
+---
+
+## 🚀 Overview
+
+Doc AI Invoice Extractor is a production-ready Document AI pipeline designed to automatically extract structured fields from invoice PDFs such as:
+
+- Dealer Name  
+- Model Name  
+- Horse Power  
+- Asset Cost  
+- Signature / Stamp Presence  
+
+The system is built with a deterministic, CPU-only architecture and supports large-scale evaluation, robustness testing, and judge-style verification.
+
+It was developed as part of **Convolve 4.0 GenAI Track** and is designed for real-world deployment in document automation and financial workflows.
+
+---
+
+## 🎯 Use Cases
+
+- Automated invoice processing for enterprises  
+- OCR-based financial document analysis  
+- AI-powered document digitization  
+- Robotic Process Automation (RPA) pipelines  
+- Audit and compliance automation  
+
+---
+
+## 🧠 Key Capabilities
+
+- Multilingual OCR pipeline  
+- Layout-aware invoice parsing  
+- Deterministic evaluation framework  
+- Robust noise stress testing  
+- Judge-style schema & latency validation  
+- Streamlit live demo interface  
+- CSV / JSON export for downstream systems  
+
+---
+
+## 🏗 System Architecture
+
+PDF → PyMuPDF (Image Extraction)  
+OCR → PaddleOCR  
+Parsing → Layout rules + fuzzy matching  
+Validation → Schema + latency + cost gate  
+Output → Strict JSON + CSV  
+
+---
+
+## 🛠 Tech Stack
+
+- Python  
+- PyMuPDF  
+- PaddleOCR  
+- Streamlit  
+- OpenCV  
+- NumPy  
+- Deterministic evaluation framework  
+
+---
+
+
+
 # doc-ai-invoice-extractor
 Intelligent Document AI system for multilingual invoice field extraction (Convolve 4.0 GenAI Track)
 
