@@ -92,7 +92,14 @@ def _tesseract_lang_arg(paddle_langs: Iterable[str]) -> str:
 	return "+".join(chosen)
 
 
-def tesseract_run_page(page_index: int, image: Image.Image, *, langs: Optional[Iterable[str]] = None) -> OCRPage:
+def tesseract_run_page(
+	page_index: int,
+	image: Image.Image,
+	*,
+	langs: Optional[Iterable[str]] = None,
+	psm: int = 6,
+	timeout_sec: float = 8.0,
+) -> OCRPage:
 	"""Offline-safe OCR using Tesseract TSV output.
 
 	Returns OCRPage with word boxes as 4 points (compatible with layout.py).
@@ -106,10 +113,10 @@ def tesseract_run_page(page_index: int, image: Image.Image, *, langs: Optional[I
 	try:
 		with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
 			image.convert("RGB").save(tmp.name, format="PNG", optimize=True)
-			cmd = [path, tmp.name, "stdout", "--psm", "6", "tsv"]
+			cmd = [path, tmp.name, "stdout", "--psm", str(int(psm)), "tsv"]
 			if lang_arg:
-				cmd = [path, tmp.name, "stdout", "-l", lang_arg, "--psm", "6", "tsv"]
-			p = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=8.0)
+				cmd = [path, tmp.name, "stdout", "-l", lang_arg, "--psm", str(int(psm)), "tsv"]
+			p = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=float(timeout_sec))
 			if p.returncode != 0:
 				return OCRPage(page_index=page_index, words=[])
 			tsv = p.stdout or ""
@@ -144,6 +151,45 @@ def tesseract_run_page(page_index: int, image: Image.Image, *, langs: Optional[I
 		words.append(OCRWord(text=text, bbox=bbox, conf=float(conf_raw / 100.0)))
 
 	return OCRPage(page_index=page_index, words=words)
+
+
+def tesseract_run_page_best(
+	page_index: int,
+	image: Image.Image,
+	*,
+	langs: Optional[Iterable[str]] = None,
+	psms: Iterable[int] = (6, 3, 11),
+	per_try_timeout_sec: float = 8.0,
+	min_words_early_exit: int = 110,
+) -> OCRPage:
+	"""Try multiple Tesseract PSM modes and pick the best OCRPage.
+
+	Some invoices OCR significantly better under different PSM settings.
+	We choose the result with the best word_count-first score.
+	"""
+	best: OCRPage | None = None
+	best_score: float = -1.0
+	for psm in psms:
+		page = tesseract_run_page(
+			page_index,
+			image,
+			langs=langs,
+			psm=int(psm),
+			timeout_sec=float(per_try_timeout_sec),
+		)
+		words = list(getattr(page, "words", []) or [])
+		if words and len(words) >= int(min_words_early_exit):
+			# Plenty of words: good enough, avoid burning time on other PSMs.
+			return page
+		if not words:
+			score = 0.0
+		else:
+			avg = float(sum(float(w.conf) for w in words) / max(1, len(words)))
+			score = float(len(words)) + 0.25 * avg
+		if score > best_score:
+			best_score = score
+			best = page
+	return best or OCRPage(page_index=page_index, words=[])
 
 
 class PaddleOCREngine:
@@ -235,15 +281,48 @@ class PaddleOCREngine:
 
 	@staticmethod
 	def _parse_result(result: Any) -> List[OCRWord]:
+		"""Parse PaddleOCR output into OCRWord list.
+
+		PaddleOCR output shape can vary by version:
+		- Often: [[box, (text, conf)], ...]
+		- Sometimes for single image: [[[box, (text, conf)], ...]]
+		"""
+		if not result:
+			return []
+
+		items = result
+		# Common: for a single image, PaddleOCR returns a list with one element
+		# that itself is the list of line results.
+		if isinstance(items, list) and len(items) == 1 and isinstance(items[0], list):
+			items = items[0]
+
 		words: List[OCRWord] = []
-		for line in result or []:
+		for line in items or []:
+			if not line:
+				continue
 			try:
-				box, (text, conf) = line
+				box = None
+				text = None
+				conf = None
+				# line can be list/tuple: [box, (text, conf)]
+				if isinstance(line, (list, tuple)) and len(line) >= 2:
+					box = line[0]
+					pair = line[1]
+					if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+						text, conf = pair[0], pair[1]
+				# Some versions may emit dict-ish rows
+				elif isinstance(line, dict):
+					text = line.get("text")
+					conf = line.get("score") or line.get("conf")
+					box = line.get("bbox") or line.get("box")
 			except Exception:
 				continue
 			if text is None:
 				continue
-			words.append(OCRWord(text=str(text), bbox=box, conf=float(conf or 0.0)))
+			try:
+				words.append(OCRWord(text=str(text), bbox=box, conf=float(conf or 0.0)))
+			except Exception:
+				continue
 		return words
 
 	@staticmethod

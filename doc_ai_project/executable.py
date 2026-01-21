@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -16,10 +17,14 @@ from explainability import save_field_overlays
 from extractor import (
 	aggregate_confidence,
 	calibrate_doc_confidence,
+	detect_signature_presence,
+	detect_stamp_presence,
+	extract_fields,
 	extract_asset_cost,
 	extract_dealer_name,
 	extract_horse_power,
 	extract_model_name,
+	normalize_dealer_name,
 )
 from layout import build_structured_layout, merge_structured_layouts
 from ocr_fallback import pymupdf_extract_words
@@ -55,6 +60,43 @@ def _resolve_out_path(*, base_dir: Path, config: PipelineConfig, out_arg: str) -
 		out_path = output_dir.joinpath(*parts) if parts else (output_dir / "result.json")
 	out_path.parent.mkdir(parents=True, exist_ok=True)
 	return out_path
+
+
+def _resolve_in_path(*, base_dir: Path, in_arg: str) -> Path:
+	"""Best-effort input path resolution.
+
+	This repo is often run from different working directories; users also
+	sometimes pass paths like ../data/images/... which may not exist depending
+	on CWD. We try a few common anchors (repo root, base_dir, data/images).
+	"""
+	p = Path(in_arg)
+	if p.exists():
+		return p
+
+	# Try relative to this module directory.
+	if not p.is_absolute():
+		cand = base_dir / p
+		if cand.exists():
+			return cand
+
+		repo_root = base_dir.parent
+		cand = repo_root / p
+		if cand.exists():
+			return cand
+
+		parts = list(p.parts)
+		if "data" in parts:
+			idx = parts.index("data")
+			cand = repo_root.joinpath(*parts[idx:])
+			if cand.exists():
+				return cand
+
+		# Common location: repo_root/data/images/<filename>
+		cand = repo_root / "data" / "images" / p.name
+		if cand.exists():
+			return cand
+
+	return p
 
 
 def _write_result_json(*, result: Dict, out_path: Path) -> None:
@@ -291,6 +333,7 @@ def run_pipeline(pdf_path: str, doc_id: str, config: PipelineConfig) -> Dict:
 			region_overrides["footer"].setdefault("header", 0.85)
 
 		t0 = time.perf_counter()
+		ocr_text = "\n".join([ln.text for ln in doc_layout.all_lines if (ln.text or "").strip()])
 		dealer = extract_dealer_name(
 			doc_layout,
 			base_dir=base_dir,
@@ -333,13 +376,16 @@ def run_pipeline(pdf_path: str, doc_id: str, config: PipelineConfig) -> Dict:
 
 		# 6) Assemble + validate
 		t0 = time.perf_counter()
+		dealer_out = normalize_dealer_name(clean_str(dealer.value if isinstance(dealer.value, str) else None))
+		signature_present = bool(detect_signature_presence(ocr_text))
+		stamp_present = bool(detect_stamp_presence(ocr_text))
 		fields = InvoiceFields(
-			dealer_name=clean_str(dealer.value if isinstance(dealer.value, str) else None),
+			dealer_name=dealer_out,
 			model_name=clean_str(model.value if isinstance(model.value, str) else None),
 			horse_power=clean_int(hp.value),
 			asset_cost=clean_int(asset.value),
-			signature=PresenceBox(present=bool(sig), bbox=sig.bbox.as_list() if sig else []),
-			stamp=PresenceBox(present=bool(stamp), bbox=stamp.bbox.as_list() if stamp else []),
+			signature=PresenceBox(present=signature_present, bbox=sig.bbox.as_list() if sig else []),
+			stamp=PresenceBox(present=stamp_present, bbox=stamp.bbox.as_list() if stamp else []),
 		)
 
 		pages_n = len(page_images)
@@ -413,8 +459,8 @@ def run_pipeline(pdf_path: str, doc_id: str, config: PipelineConfig) -> Dict:
 			"avg_ocr_conf": round(avg_ocr_conf, 4),
 			"region_line_counts": region_counts,
 			"yolo_used": False,
-			"signature_present": False,
-			"stamp_present": False,
+			"signature_present": bool(signature_present),
+			"stamp_present": bool(stamp_present),
 			"fields": {k: v.as_log_dict() for k, v in per_field.items()},
 		}
 		log_path = output_dir / "runs.jsonl"
@@ -579,12 +625,107 @@ def _run_image_pipeline_core(image_path: str, doc_id: str, config: PipelineConfi
 		if (page is None) or (not getattr(page, "words", [])):
 			try:
 				from ocr import tesseract_run_page
+				# Prefer fast/stable English-only first.
+				# Using multiple languages can significantly slow Tesseract.
+				fallback_langs = ["en"]
 
-				fallback_page = tesseract_run_page(0, img, langs=list(engine_kwargs.get("langs") or ("en",)))
-				if getattr(fallback_page, "words", []):
-					page = fallback_page
+				def _score_candidate(*, cand_fields: Dict, cand_text: str, word_count: int) -> int:
+					m = (cand_fields or {}).get("model_name")
+					c = (cand_fields or {}).get("asset_cost")
+					# Penalize obviously bad model/cost to steer selection.
+					bad_model = bool(
+						re.search(
+							r"(?i)\b(authori[sz]ed\s+dealer|authori[sz]ed\s+distributor|dealer\b|implements?\b|spares?\b|parts?\b)\b",
+							str(m or ""),
+						)
+						or re.search(r"(?i)\b(servicing|service|free\s+servic|materials|terms|conditions|delivery)\b", str(m or ""))
+						or re.search(r"(?i)\b(hood|hitch|trailer|trailor|plough|tiller|leveller|cage\s*wheel)\b", str(m or ""))
+					)
+					# Contact/ID lines (ph/gst/tin) often create false asset costs.
+					bad_cost = False
+					if c is not None:
+						try:
+							ci = int(c)
+							bad_cost = ci < 10000 or bool(
+								re.search(
+									rf"(?i)\b(ph\.?|phone|mob\.?|mobile|tel\.?|tin\b|gst\b|pan\b|a/c\b|ac\b|ifsc|bank)\b[^\n]*\b{ci}\b",
+									cand_text,
+								)
+							)
+						except Exception:
+							bad_cost = True
+
+					dealer_ok = bool((cand_fields or {}).get("dealer_name"))
+					model_ok = bool((cand_fields or {}).get("model_name")) and (not bad_model)
+					hp_ok = bool((cand_fields or {}).get("horse_power"))
+					cost_ok = bool((cand_fields or {}).get("asset_cost")) and (not bad_cost)
+					# Prioritize numeric fields (HP/cost) over dealer/model.
+					filled_score = (3 * int(hp_ok) + 3 * int(cost_ok) + 1 * int(dealer_ok) + 1 * int(model_ok))
+					return int(filled_score * 1000 + int(word_count))
+
+				# Try a small set of PSM modes and pick the one that yields the
+				# best downstream field extraction (not necessarily the most words).
+				best = None
+				best_psm = None
+				best_score = -1
+				best_fields: Dict = {}
+				remaining = float(deadline - time.perf_counter())
+				# Reserve time for potential mixed-language OCR + layout/extraction.
+				per_try = min(4.5, max(2.5, remaining - 12.0))
+				# Pass 1: English-only
+				for psm in (6, 3):
+					if float(deadline - time.perf_counter()) <= 2.0:
+						break
+					cand = tesseract_run_page(0, img, langs=fallback_langs, psm=int(psm), timeout_sec=float(per_try))
+					if not getattr(cand, "words", []):
+						continue
+					cand_layout = build_structured_layout(cand, (img.width, img.height))
+					cand_text = "\n".join([ln.text for ln in cand_layout.all_lines if (ln.text or "").strip()])
+					cand_fields = extract_fields(cand_text) if cand_text.strip() else {}
+					score = _score_candidate(
+						cand_fields=cand_fields,
+						cand_text=cand_text,
+						word_count=len(getattr(cand, "words", [])),
+					)
+					if score > best_score:
+						best_score = score
+						best = cand
+						best_psm = int(psm)
+						best_fields = dict(cand_fields or {})
+					# Early exit if we got a strong result.
+					if best_score >= 6000:
+						break
+
+				# Pass 2 (conditional): try mixed Hindi+English if numeric fields are still missing
+				need_numeric = (not bool((best_fields or {}).get("horse_power"))) or (not bool((best_fields or {}).get("asset_cost")))
+				# Only attempt the slower mixed-language OCR when we have enough budget left.
+				if need_numeric and float(deadline - time.perf_counter()) > 10.0:
+					mixed_langs = ["en", "devanagari"]
+					for psm in (3,):
+						if float(deadline - time.perf_counter()) <= 2.0:
+							break
+						cand_timeout = float(min(8.0, max(4.0, deadline - time.perf_counter() - 5.0)))
+						cand = tesseract_run_page(0, img, langs=mixed_langs, psm=int(psm), timeout_sec=cand_timeout)
+						if not getattr(cand, "words", []):
+							continue
+						cand_layout = build_structured_layout(cand, (img.width, img.height))
+						cand_text = "\n".join([ln.text for ln in cand_layout.all_lines if (ln.text or "").strip()])
+						cand_fields = extract_fields(cand_text) if cand_text.strip() else {}
+						score = _score_candidate(
+							cand_fields=cand_fields,
+							cand_text=cand_text,
+							word_count=len(getattr(cand, "words", [])),
+						)
+						if score > best_score:
+							best_score = score
+							best = cand
+							best_psm = int(psm)
+							best_fields = dict(cand_fields or {})
+
+				if best is not None:
+					page = best
 					ocr_fallback_used = True
-					ocr_mode = "tesseract"
+					ocr_mode = f"tesseract_psm{best_psm}" if best_psm is not None else "tesseract"
 				else:
 					# Fully offline-safe: return empty OCR (still schema-valid output).
 					page = type("_", (), {"page_index": 0, "words": [], "texts": lambda self: []})()
@@ -635,6 +776,7 @@ def _run_image_pipeline_core(image_path: str, doc_id: str, config: PipelineConfi
 			region_overrides["footer"].setdefault("header", 0.85)
 
 		t0 = time.perf_counter()
+		ocr_text = "\n".join([ln.text for ln in doc_layout.all_lines if (ln.text or "").strip()])
 		dealer = extract_dealer_name(
 			doc_layout,
 			base_dir=base_dir,
@@ -651,6 +793,34 @@ def _run_image_pipeline_core(image_path: str, doc_id: str, config: PipelineConfi
 		hp = extract_horse_power(doc_layout, region_weight_overrides=region_overrides)
 		asset = extract_asset_cost(doc_layout, region_weight_overrides=region_overrides, header_first=bool(strategy.header_first))
 		per_field = {"dealer_name": dealer, "model_name": model, "horse_power": hp, "asset_cost": asset}
+
+		# Fallback: if OCR produced text but structured extraction missed, use
+		# simple regex rules (per prompt) to populate missing fields.
+		fallback = extract_fields(ocr_text)
+		fallback_dealer = fallback.get("dealer_name") if isinstance(fallback, dict) else None
+		fallback_model = fallback.get("model_name") if isinstance(fallback, dict) else None
+		fallback_hp = fallback.get("horse_power") if isinstance(fallback, dict) else None
+		fallback_cost = fallback.get("asset_cost") if isinstance(fallback, dict) else None
+
+		def _bad_model_text(s: str | None) -> bool:
+			if not s:
+				return True
+			ss = str(s)
+			return bool(
+				re.search(
+					r"(?i)\b(servicing|service|free\s+servic|materials|guarantee|terms|conditions|subsidy|permit|delivery)\b",
+					ss,
+				)
+				or re.search(r"(?i)\b(hood|hitch|trailer|trailor|plough|tiller|leveller|cage\s*wheel|toolskit|battery)\b", ss)
+			)
+
+		def _looks_like_contact_number(v: int | None, text: str) -> bool:
+			if v is None:
+				return False
+			pat = re.compile(
+				rf"(?i)\b(ph\.?|phone|mob\.?|mobile|mo\.?|tel\.?|tin\b|gst\b|pan\b|a/c\b|ac\b|account|ifsc|bank)\b[^\n]*\b{int(v)}\b"
+			)
+			return bool(pat.search(text or ""))
 
 		base_conf = aggregate_confidence(per_field)
 		doc_conf = calibrate_doc_confidence(
@@ -671,15 +841,38 @@ def _run_image_pipeline_core(image_path: str, doc_id: str, config: PipelineConfi
 		cost_breakdown = estimate_cost_breakdown(config=config, pages=1, yolo_used=False)
 		cost_estimate = estimate_cost(config=config, pages=1, yolo_used=False)
 
+		chosen_model = clean_str(model.value) if model.value is not None else None
+		if _bad_model_text(chosen_model):
+			chosen_model = clean_str(fallback_model)
+
+		fallback_cost_i = clean_int(fallback_cost)
+		chosen_cost = clean_int(asset.value) if asset.value is not None else fallback_cost_i
+		# Replace suspicious contact/ID-derived numbers with fallback.
+		if chosen_cost is not None and _looks_like_contact_number(int(chosen_cost), ocr_text):
+			chosen_cost = fallback_cost_i
+		# Enforce a minimal plausible rupee amount; if structured is tiny, try fallback.
+		if chosen_cost is not None and int(chosen_cost) < 10000:
+			chosen_cost = fallback_cost_i
+			if chosen_cost is not None and int(chosen_cost) < 10000:
+				chosen_cost = None
+
+		chosen_hp = clean_int(hp.value) if hp.value is not None else clean_int(fallback_hp)
+		if chosen_hp is not None and not (10 <= int(chosen_hp) <= 125):
+			chosen_hp = clean_int(fallback_hp)
+			if chosen_hp is not None and not (10 <= int(chosen_hp) <= 125):
+				chosen_hp = None
+
 		out = {
 			"doc_id": str(doc_id),
 			"fields": {
-				"dealer_name": clean_str(dealer.value) if dealer.value is not None else None,
-				"model_name": clean_str(model.value) if model.value is not None else None,
-				"horse_power": clean_int(hp.value) if hp.value is not None else None,
-				"asset_cost": clean_int(asset.value) if asset.value is not None else None,
-				"signature": {"present": False, "bbox": []},
-				"stamp": {"present": False, "bbox": []},
+				"dealer_name": normalize_dealer_name(
+					clean_str(dealer.value) if dealer.value is not None else clean_str(fallback_dealer)
+				),
+				"model_name": chosen_model,
+				"horse_power": chosen_hp,
+				"asset_cost": chosen_cost,
+				"signature": {"present": bool(detect_signature_presence(ocr_text)), "bbox": []},
+				"stamp": {"present": bool(detect_stamp_presence(ocr_text)), "bbox": []},
 			},
 			"confidence": float(doc_conf),
 			"review_required": bool(doc_conf < float(getattr(config, "review_conf_threshold", 0.75))),
@@ -770,8 +963,49 @@ def main() -> int:
 		os.environ["DOC_AI_ENABLE_PADDLEOCR"] = "1"
 
 	base_dir = Path(__file__).resolve().parent
-	input_path = args.png or args.pdf
-	doc_id = args.doc_id or Path(input_path).stem
+	input_path_raw = args.png or args.pdf
+
+	# User-friendly recovery: sometimes people accidentally do
+	#   --png path/to/img.png/outputs/result.json
+	# instead of
+	#   --png path/to/img.png --out outputs/result.json
+	# Try to auto-split when we see both an image/pdf extension and a .json.
+	if args.png and (".png" in str(args.png).lower() or ".jpg" in str(args.png).lower() or ".jpeg" in str(args.png).lower()):
+		s = str(args.png)
+		lower = s.lower()
+		if ".json" in lower and (".png" in lower or ".jpg" in lower or ".jpeg" in lower):
+			# Split at the first image extension occurrence.
+			for ext in (".png", ".jpg", ".jpeg"):
+				idx = lower.find(ext)
+				if idx != -1:
+					cut = idx + len(ext)
+					img_part = s[:cut]
+					out_part = s[cut:]
+					# If the remainder looks like an output path, adopt it.
+					if ".json" in out_part.lower():
+						args.png = img_part
+						# Trim leading separators so it behaves like a normal relative path.
+						out_part = out_part.lstrip("/\\")
+						if out_part:
+							args.out = out_part
+					break
+
+	resolved_input = _resolve_in_path(base_dir=base_dir, in_arg=str(args.png or args.pdf))
+	if not resolved_input.exists():
+		print(f"[error] input not found: {resolved_input}", file=sys.stderr)
+		if args.png:
+			print(
+				"[hint] usage: python executable.py --png <image.png> --out outputs/result.json",
+				file=sys.stderr,
+			)
+		else:
+			print(
+				"[hint] usage: python executable.py --pdf <file.pdf> --out outputs/result.json",
+				file=sys.stderr,
+			)
+		return 2
+
+	doc_id = args.doc_id or resolved_input.stem
 	if args.config:
 		cfg_path = Path(args.config)
 		if not cfg_path.is_absolute():
@@ -794,9 +1028,9 @@ def main() -> int:
 	_CLI_DOC_ID = doc_id
 
 	if args.png:
-		result = run_image_pipeline(args.png, args.out)
+		result = run_image_pipeline(str(resolved_input), args.out)
 	else:
-		result = run_pdf_pipeline(args.pdf, args.out)
+		result = run_pdf_pipeline(str(resolved_input), args.out)
 
 	output_dir = cfg.output_dir if Path(cfg.output_dir).is_absolute() else (base_dir / cfg.output_dir)
 
