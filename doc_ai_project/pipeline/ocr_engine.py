@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from PIL import Image
 
 
+
 class OCRFailure(RuntimeError):
 	"""Raised when OCR cannot be produced within constraints."""
 
@@ -109,7 +110,9 @@ def _worker_main(req_q: Queue, resp_q: Queue) -> None:
 			if req.type == "run_page":
 				# Offline-safe: never initialize PaddleOCR during timed execution unless warmup succeeded.
 				if engine is None and not warmed_up:
-					raise OCRFailure("paddle_models_not_warmed_up")
+					# Return empty OCR rather than failing; caller can fallback/continue.
+					resp_q.put(OCRResponse(ok=True, page_index=int(req.page_index or 0), words=[]))
+					continue
 				if engine is None:
 					engine_kwargs = dict(req.engine_kwargs or {})
 					engine = PaddleOCREngine(**engine_kwargs)
@@ -201,12 +204,12 @@ def get_ocr_worker() -> OCRWorker:
 	return _OCR_WORKER
 
 
-def warmup_ocr(*, seed: int = 1337, engine_kwargs: Optional[Dict[str, Any]] = None) -> bool:
+def warmup_ocr(*, seed: int = 1337, engine_kwargs: Optional[Dict[str, Any]] = None, timeout_sec: float = 10.0) -> bool:
 	"""Warm up PaddleOCR models once (in an isolated process).
 
 	Safe to call multiple times.
 	"""
-	return get_ocr_worker().warmup(seed=int(seed), engine_kwargs=engine_kwargs or {})
+	return get_ocr_worker().warmup(seed=int(seed), engine_kwargs=engine_kwargs or {}, timeout_sec=float(timeout_sec))
 
 
 def ocr_page_with_timeout(

@@ -93,6 +93,58 @@ python convert_images_to_pdf.py
 
 Place invoice scans under `data/images/` (JPG/PNG). Outputs are written to `data/pdfs/` (one PDF per image).
 
+## EDA Workflow for Jury Evaluation
+
+Final jury evaluation uses **PNG invoice images only** and will run the **extraction code only**.
+EDA must be generated **offline** and submitted as a separate report.
+
+### 1) Validate dataset (PNG-only)
+
+```bash
+python dataset_preflight.py --invoices data/images --labels data/labels
+```
+
+This fails fast if any **non-PNG** invoice files exist under `data/images/`.
+
+### 2) Generate offline EDA report (one command)
+
+```bash
+./run_eda.sh
+```
+
+Outputs (default):
+- `outputs/eda/eda_report.json`
+- `outputs/eda/eda_summary.csv`
+- `outputs/eda/eda_report.pdf`
+- `outputs/eda/eda_profile.json`
+
+Submit `eda_report.pdf` (and optionally `eda_summary.csv`) as your offline EDA deliverable.
+
+### 3) Data-driven extraction (judge-safe)
+
+The extraction pipeline **never runs EDA**.
+Instead, it **optionally reads** the lightweight profile file `eda_profile.json` produced by offline EDA to adjust strategies:
+
+- Header-first extraction when text is top-heavy
+- Keyword-anchored extraction for noisy layouts
+- Multilingual OCR selection when Hindi is detected
+- Automatic upscaling for low-resolution scans
+
+Profile lookup order:
+1. `EDA_PROFILE_PATH` (env var)
+2. `eda_profile.json` (repo root)
+3. `outputs/eda/eda_profile.json`
+
+To run extraction on a PNG invoice:
+
+```bash
+python doc_ai_project/executable.py --png data/images/<invoice>.png --out outputs/result.json
+```
+
+Notes:
+- Offline EDA is optional. If `eda_profile.json` is missing, extraction uses safe defaults.
+- Artifacts like diagrams/error reports are **opt-in** (see `--diagram`, `--eda-artifacts`, `--error-report`).
+
 ## Run on Official Dataset
 
 Final submission (recommended): run end-to-end finalize + gating in one command.

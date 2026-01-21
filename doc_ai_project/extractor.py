@@ -165,6 +165,7 @@ def extract_dealer_name(
 	base_dir: Path,
 	threshold: int = 90,
 	region_weight_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+	keyword_anchored: bool = False,
 ) -> FieldCandidate:
 	masters = load_dealer_master_list(base_dir)
 	# Region priority: header -> body -> footer
@@ -199,8 +200,8 @@ def extract_dealer_name(
 				best_val, best_score, best_ln, best_region = m, s, ln, region
 				used_fallback = False
 
-		# Second pass: general fuzzy over region
-		if best_score < threshold:
+		# Second pass: general fuzzy over region (skip in keyword-anchored mode)
+		if (not keyword_anchored) and best_score < threshold:
 			for ln in lines_pref[:80]:
 				m, s = _best_fuzzy_match(_adapt_text(base_dir=base_dir, kind="dealer", text=ln.text), masters)
 				if m and s > best_score:
@@ -218,6 +219,20 @@ def extract_dealer_name(
 	conf = float(round(ocr_conf * rule_conf * region_conf, 4))
 
 	if best_val is None or best_score < threshold:
+		# In noisy layouts, prefer returning a keyword-anchored best-effort candidate
+		# rather than None (still low confidence so downstream can mark review_required).
+		if keyword_anchored and best_val is not None and best_ln is not None:
+			return FieldCandidate(
+				value=best_val,
+				conf=float(round(conf * 0.75, 4)),
+				ocr_conf=ocr_conf,
+				rule_conf=rule_conf,
+				region_conf=region_conf,
+				region=best_region or "unknown",
+				used_fallback=True,
+				source=best_ln.text,
+				bbox=best_ln.bbox,
+			)
 		return FieldCandidate(
 			value=None,
 			conf=conf * 0.5,
@@ -247,9 +262,38 @@ def extract_model_name(
 	layout: StructuredLayout,
 	base_dir: Path,
 	region_weight_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+	keyword_anchored: bool = False,
 ) -> FieldCandidate:
 	models = load_model_master_list(base_dir)
 	priorities = ["table", "body", "header", "footer"]
+
+	# In noisy layouts, try keyword-anchored label extraction first.
+	if keyword_anchored:
+		label_re = re.compile(r"(?i)\bmodel\b|मॉडल|माडल|मोडल|મોડલ|મોડેલ")
+		for region in priorities:
+			for ln in layout.regions[region].lines:
+				txt = normalize_keywords(_adapt_text(base_dir=base_dir, kind="model", text=ln.text))
+				if not label_re.search(txt):
+					continue
+				parts = re.split(r"[:\-]", ln.text, maxsplit=1)
+				candidate = normalize_spaces(parts[1] if len(parts) == 2 else "")
+				candidate = _adapt_text(base_dir=base_dir, kind="model", text=candidate)
+				if candidate:
+					ocr_conf = float(ln.avg_conf)
+					rule_conf = 0.6
+					region_conf = _region_weight(region, expected="table", overrides=region_weight_overrides) * float(layout.regions[region].confidence)
+					conf = float(round(ocr_conf * rule_conf * region_conf, 4))
+					return FieldCandidate(
+						value=candidate,
+						conf=conf,
+						ocr_conf=ocr_conf,
+						rule_conf=rule_conf,
+						region_conf=region_conf,
+						region=region,
+						used_fallback=True,
+						source=ln.text,
+						bbox=ln.bbox,
+					)
 
 	for region in priorities:
 		for ln in layout.regions[region].lines:
@@ -345,11 +389,12 @@ def extract_horse_power(
 def extract_asset_cost(
 	layout: StructuredLayout,
 	region_weight_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+	header_first: bool = False,
 ) -> FieldCandidate:
 	base_dir = Path(__file__).resolve().parent
 	# Prefer footer totals
 	label_re = re.compile(r"(?i)asset\s*cost|invoice\s*amount|grand\s*total|net\s*amount|total\b|amount\b|राशि|कुल|कुल\s*राशि|કુલ|રકમ")
-	regions = ["footer", "table", "body", "header"]
+	regions = ["header", "footer", "table", "body"] if header_first else ["footer", "table", "body", "header"]
 	last_page = 0
 	try:
 		last_page = max([ln.page_index for ln in layout.all_lines]) if layout.all_lines else 0

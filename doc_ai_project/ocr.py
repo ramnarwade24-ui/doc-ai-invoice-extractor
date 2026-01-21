@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional
 
 import os
+import subprocess
+import tempfile
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image
@@ -31,6 +34,118 @@ class OCRPage:
 		return [w.text for w in self.words if w.text]
 
 
+@lru_cache(maxsize=1)
+def _tesseract_path() -> str:
+	from shutil import which
+
+	return which("tesseract") or ""
+
+
+@lru_cache(maxsize=1)
+def _tesseract_langs_available() -> set[str]:
+	"""Return installed Tesseract language codes (best effort)."""
+	path = _tesseract_path()
+	if not path:
+		return set()
+	try:
+		p = subprocess.run([path, "--list-langs"], check=False, capture_output=True, text=True, timeout=3.0)
+		out = (p.stdout or "") + "\n" + (p.stderr or "")
+		langs: set[str] = set()
+		for line in out.splitlines():
+			s = line.strip()
+			if not s or s.lower().startswith("list of available languages"):
+				continue
+			# each language is on its own line
+			if " " not in s and "\t" not in s:
+				langs.add(s)
+		return langs
+	except Exception:
+		return set()
+
+
+def _tesseract_lang_arg(paddle_langs: Iterable[str]) -> str:
+	"""Map our language hints to tesseract -l codes (only those installed)."""
+	avail = _tesseract_langs_available()
+	# minimal mapping
+	map_ = {
+		"en": "eng",
+		"english": "eng",
+		"devanagari": "hin",
+		"hi": "hin",
+		"hindi": "hin",
+		"gujarati": "guj",
+		"gu": "guj",
+	}
+	chosen: List[str] = []
+	for l in paddle_langs:
+		code = map_.get(str(l).strip().lower())
+		if not code:
+			continue
+		if avail and code not in avail:
+			continue
+		if code not in chosen:
+			chosen.append(code)
+	# If we couldn't detect installed langs, or none matched, fall back to eng if possible.
+	if not chosen:
+		if (not avail) or ("eng" in avail):
+			chosen = ["eng"]
+	return "+".join(chosen)
+
+
+def tesseract_run_page(page_index: int, image: Image.Image, *, langs: Optional[Iterable[str]] = None) -> OCRPage:
+	"""Offline-safe OCR using Tesseract TSV output.
+
+	Returns OCRPage with word boxes as 4 points (compatible with layout.py).
+	If tesseract is not available or fails, returns an empty OCRPage.
+	"""
+	path = _tesseract_path()
+	if not path:
+		return OCRPage(page_index=page_index, words=[])
+
+	lang_arg = _tesseract_lang_arg(langs or ["en"])
+	try:
+		with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+			image.convert("RGB").save(tmp.name, format="PNG", optimize=True)
+			cmd = [path, tmp.name, "stdout", "--psm", "6", "tsv"]
+			if lang_arg:
+				cmd = [path, tmp.name, "stdout", "-l", lang_arg, "--psm", "6", "tsv"]
+			p = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=8.0)
+			if p.returncode != 0:
+				return OCRPage(page_index=page_index, words=[])
+			tsv = p.stdout or ""
+	except Exception:
+		return OCRPage(page_index=page_index, words=[])
+
+	words: List[OCRWord] = []
+	lines = tsv.splitlines()
+	if not lines:
+		return OCRPage(page_index=page_index, words=[])
+	# Header: level page_num block_num par_num line_num word_num left top width height conf text
+	for row in lines[1:]:
+		parts = row.split("\t")
+		if len(parts) < 12:
+			continue
+		try:
+			level = int(parts[0])
+			left = float(parts[6]); top = float(parts[7]); w = float(parts[8]); h = float(parts[9])
+			conf_raw = float(parts[10])
+			text = str(parts[11] or "").strip()
+		except Exception:
+			continue
+		# word level is 5 in tesseract tsv
+		if level != 5:
+			continue
+		if not text:
+			continue
+		if conf_raw < 0:
+			continue
+		x0, y0, x1, y1 = left, top, left + w, top + h
+		bbox = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+		words.append(OCRWord(text=text, bbox=bbox, conf=float(conf_raw / 100.0)))
+
+	return OCRPage(page_index=page_index, words=words)
+
+
 class PaddleOCREngine:
 	def __init__(
 		self,
@@ -52,10 +167,24 @@ class PaddleOCREngine:
 		os.environ.setdefault("FLAGS_enable_ir_optim", "0")
 		try:
 			from paddleocr import PaddleOCR  # type: ignore
-		except Exception as e:
-			raise RuntimeError(
-				"PaddleOCR is not available. Install dependencies from requirements.txt"
-			) from e
+		except Exception:
+			# Offline-safe behavior: if PaddleOCR isn't available in the environment,
+			# keep the engine constructible and return empty OCR results.
+			self.langs = []
+			self.use_angle_cls = use_angle_cls
+			self.max_retries = max(0, int(max_retries))
+			self.preprocess_variants = preprocess_variants or [
+				(True, True, True),
+				(False, True, True),
+				(True, False, True),
+			]
+			self.autorotate = bool(autorotate)
+			self.adaptive_threshold = bool(adaptive_threshold)
+			self.shadow_remove = bool(shadow_remove)
+			self.perspective_correct = bool(perspective_correct)
+			self.upscale_if_low_res = bool(upscale_if_low_res)
+			self._ocr_by_lang = {}
+			return
 
 		# PaddleOCR language selection is model-dependent. We run a best-effort multilingual strategy:
 		# try langs in order and pick the run with the best average confidence.
@@ -133,6 +262,9 @@ class PaddleOCREngine:
 
 	def run_page(self, page_index: int, image: Image.Image) -> OCRPage:
 		"""Run OCR with preprocessing + retry and best-lang selection."""
+		# Offline-safe: PaddleOCR not installed/available.
+		if not getattr(self, "_ocr_by_lang", None):
+			return OCRPage(page_index=page_index, words=[])
 		attempts = []
 		# Backward compatible: tuples may be length-3 (denoise, deskew, contrast)
 		variants = []
