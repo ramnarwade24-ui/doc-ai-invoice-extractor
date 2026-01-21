@@ -1,8 +1,37 @@
-# Doc AI Invoice Extractor
+# 📄 Document AI Invoice Extraction System
 
-An intelligent Document AI system for multilingual invoice field extraction built for large-scale evaluation and enterprise-grade robustness.
+## 🚀 Features
+## 🚀 Overview
+## 🎯 Use Cases
+## 🧠 Key Capabilities
+## 🏗️ System Architecture
+## 🛠 Tech Stack
+## 📂 Project Structure
+## ⚙ Installation
+## ▶ How To Run
+## 🔎 OCR Configuration
+## 📤 Output Format (JSON Schema)
+## 🧪 EDA Workflow for Jury Evaluation
+## 📝 Notes
 
----
+
+📄 Document AI Invoice Extraction System (PNG)
+
+A fully offline, deterministic Document AI system that extracts structured invoice data from scanned PNG images  documents using OCR and rule-based intelligence.
+
+Designed for jury evaluation, PNG-only execution, and JSON schema output.
+
+🚀 Features
+
+✔ Works fully offline (no APIs, no cloud)
+✔ Supports PNG and PDF invoices
+✔ OCR using PaddleOCR (optional)
+✔ Rule-based extraction (no training required)
+✔ Deterministic and reproducible
+✔ JSON output in required schema
+✔ Jury-safe execution
+✔ Cost + latency estimation
+✔ Explainability overlays (optional)
 
 ## 🚀 Overview
 
@@ -42,15 +71,32 @@ It was developed as part of **Convolve 4.0 GenAI Track** and is designed for rea
 
 ---
 
-## 🏗 System Architecture
 
-PDF → PyMuPDF (Image Extraction)  
-OCR → PaddleOCR  
-Parsing → Layout rules + fuzzy matching  
-Validation → Schema + latency + cost gate  
-Output → Strict JSON + CSV  
+## 🏗️ System Architecture
 
----
+```text
+Input (PNG / PDF)
+        |
+        v
+Image Loader / PDF Renderer
+        |
+        v
+OCR Engine (PaddleOCR or fallback)
+        |
+        v
+Layout Analyzer
+        |
+        v
+Field Extractor (Regex + Heuristics)
+        |
+        v
+Validator + Confidence Scorer
+        |
+        v
+JSON Output
+```
+
+
 
 ## 🛠 Tech Stack
 
@@ -63,7 +109,25 @@ Output → Strict JSON + CSV
 - Deterministic evaluation framework  
 
 ---
+## 📂 Project Structure
 
+```text
+doc-ai-invoice-extractor/
+├── executable.py          # Main entry point
+├── requirements.txt       # Dependencies
+├── README.md              # Documentation
+├── doc_ai_project/
+│   ├── extractor.py       # Field extraction logic
+│   ├── ocr.py             # OCR engine
+│   ├── layout.py          # Layout segmentation
+│   ├── validation.py      # Output validation
+│   ├── explainability.py  # Optional overlays
+│   ├── data/
+│   │   ├── images/         # PNG invoices
+│   │   └── pdfs/           # PDF invoices
+│   └── outputs/
+│       └── result.json    # Output file
+```
 
 
 # doc-ai-invoice-extractor
@@ -79,7 +143,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python executable.py --pdf /path/to/invoice.pdf
-streamlit run app.py
+
 ```
 
 Robustness stress testing (deterministic noisy variants + report): see [doc_ai_project/README.md](doc_ai_project/README.md) and run `python robustness_eval.py --input /path/to/invoice.pdf`.
@@ -97,6 +161,65 @@ Place invoice scans under `data/images/` (JPG/PNG). Outputs are written to `data
 
 Final jury evaluation uses **PNG invoice images only** and will run the **extraction code only**.
 EDA must be generated **offline** and submitted as a separate report.
+
+Input Format
+PNG Input
+data/images/invoice.png
+
+PDF Input
+data/pdfs/invoice.pdf
+
+📤 Output Format (JSON Schema)
+{
+  "doc_id": "invoice_001",
+  "fields": {
+    "dealer_name": "ABC Tractors Pvt Ltd",
+    "model_name": "Mahindra 575 DI",
+    "horse_power": 50,
+    "asset_cost": 525000,
+    "signature": {
+      "present": false,
+      "bbox": []
+    },
+    "stamp": {
+      "present": false,
+      "bbox": []
+    }
+  },
+  "confidence": 0.52,
+  "review_required": true,
+  "processing_time_sec": 6.29,
+  "cost_estimate_usd": 0.00089
+}
+
+⚙ Installation
+1️⃣ Create Virtual Environment (Python 3.10 recommended)
+py -3.10 -m venv venv
+venv\Scripts\activate
+
+2️⃣ Install Dependencies
+pip install -r requirements.txt
+
+▶ How To Run
+🔹 Run on PNG (Jury Mode)
+python executable.py --png data/images/invoice.png --out outputs/result.json
+
+
+🔎 Enable OCR 
+
+By default OCR is safe-mode. To enable PaddleOCR:
+
+Windows:
+set DOC_AI_ENABLE_PADDLEOCR=1
+
+Linux / Mac:
+export DOC_AI_ENABLE_PADDLEOCR=1
+
+📌 Sample Execution
+python executable.py --png data/images/sample.png --out outputs/result.json
+
+
+
 
 ### 1) Validate dataset (PNG-only)
 
@@ -120,198 +243,14 @@ Outputs (default):
 
 Submit `eda_report.pdf` (and optionally `eda_summary.csv`) as your offline EDA deliverable.
 
-### 3) Data-driven extraction (judge-safe)
-
-The extraction pipeline **never runs EDA**.
-Instead, it **optionally reads** the lightweight profile file `eda_profile.json` produced by offline EDA to adjust strategies:
-
-- Header-first extraction when text is top-heavy
-- Keyword-anchored extraction for noisy layouts
-- Multilingual OCR selection when Hindi is detected
-- Automatic upscaling for low-resolution scans
-
-Profile lookup order:
-1. `EDA_PROFILE_PATH` (env var)
-2. `eda_profile.json` (repo root)
-3. `outputs/eda/eda_profile.json`
-
-To run extraction on a PNG invoice:
-
-```bash
-python doc_ai_project/executable.py --png data/images/<invoice>.png --out outputs/result.json
 ```
+📸 Sample input PNG + output JSON
 
-Notes:
-- Offline EDA is optional. If `eda_profile.json` is missing, extraction uses safe defaults.
-- Artifacts like diagrams/error reports are **opt-in** (see `--diagram`, `--eda-artifacts`, `--error-report`).
+<img width="1919" height="979" alt="image" src="https://github.com/user-attachments/assets/15c9e819-0c24-49d9-b97f-68e0df2c2b4f" />
+<img width="1919" height="969" alt="image" src="https://github.com/user-attachments/assets/d15d284d-98c3-4d10-b0b1-0ee1843329e3" />
+<img width="1918" height="942" alt="image" src="https://github.com/user-attachments/assets/741c63df-559f-4451-b7fc-849235c43ce1" />
 
-## Run on Official Dataset
 
-Final submission (recommended): run end-to-end finalize + gating in one command.
-
-- With labels: `python doc_ai_project/submission.py --finalize --final-check --invoices data/pdfs --labels data/labels`
-- Without labels (accuracy check skipped): `python doc_ai_project/submission.py --finalize --final-check --invoices data/pdfs`
-- Gate only: `python final_submission_check.py --invoices data/pdfs --config outputs/final_config.json`
-
-Gate output: `doc_ai_project/outputs/final_submission_report.json`.
-
-This repo expects the evaluator dataset as PDFs under `data/pdfs/` (nested folders supported).
-
-```bash
-# 1) Convert images -> PDFs (one PDF per image)
-pip install pillow
-python convert_images_to_pdf.py
-
-# 2) One-command preflight (dataset exists, PDFs readable, 3 sample runs)
-python preflight.py
-
-# 3) Evaluate
-python doc_ai_project/eval.py --invoices data/pdfs
-# (Optional) with labels if you have them:
-# python doc_ai_project/eval.py --invoices data/pdfs --labels data/labels
-
-# 4) Tune (requires labels)
-python doc_ai_project/tuning.py --invoices data/pdfs --labels data/labels
-
-# 5) Select best config (optionally validate it on the dataset)
-python doc_ai_project/selector.py --tuning-report outputs/tuning_report.json --out-config best_config.json
-# python doc_ai_project/selector.py --tuning-report outputs/tuning_report.json --out-config best_config.json --invoices data/pdfs
-
-# 6) Build submission zip
-python doc_ai_project/submission.py
-
-# 7) Evaluator dry-run (schema + latency + cost + bbox/presence)
-# Provide a representative PDF from the dataset
-python doc_ai_project/dry_run.py --pdf ../data/pdfs/<some_invoice>.pdf
-
-# 8) Batch smoke test (N random PDFs, writes outputs/smoke_report.json)
-python smoke_test.py --invoices data/pdfs -n 10
-```
-
-## Final Round Demo Guide
-
-### What judges will see
-
-- A deterministic, CPU-only pipeline that extracts: dealer name, model name, horse power, asset cost, signature/stamp presence.
-- A clean “demo table” (CLI + Streamlit) plus downloadable CSV/JSON.
-- A “judge simulation” scorecard that enforces schema/latency/cost and optionally reports accuracy if labels are present.
-
-### 1) Dataset prep (images → PDFs)
-
-```bash
-pip install pillow
-python convert_images_to_pdf.py
-```
-
-### 2) Preflight (fast evaluator sanity)
-
-```bash
-python preflight.py --invoices data/pdfs
-```
-
-### 3) CLI demo (table + CSV)
-
-```bash
-python demo_runner.py --invoices data/pdfs
-# Optional deterministic subset:
-# python demo_runner.py --invoices data/pdfs --limit 25 --seed 1337
-```
-
-Outputs:
-
-- `outputs/demo_outputs/demo_results.csv`
-- `outputs/demo_outputs/demo_summary.json`
-
-### 4) Judge simulation (scorecard)
-
-```bash
-python judge_mode.py --invoices data/pdfs --n 10 --seed 1337
-# With labels (adds Accuracy + DLA):
-# python judge_mode.py --invoices data/pdfs --labels data/labels --n 10
-```
-
-Output: `outputs/judge_report.json`
-
-### 5) Streamlit live demo (ZIP of PDFs)
-
-```bash
-streamlit run doc_ai_project/app.py
-```
-
-Then open **Judge Demo** tab → upload a ZIP of PDFs → run → download CSV/JSON.
-
-**Config selection in UI**
-
-- Default: uses `doc_ai_project/best_config.json` when present.
-- You can upload a config JSON in the **Judge Demo** tab to override it.
-- The UI shows the active config filename and its SHA256 so judges can see what was run.
-
-**PASS/FAIL banner**
-
-- **PASS** means: strict schema OK + average latency ≤ 30s + average cost < $0.01.
-- **FAIL** shows the rule(s) that broke (e.g. schema validation errors, avg latency too high, avg cost too high).
-
-### One-command demo
-
-```bash
-./run_demo.sh
-```
-
-### 2-minute explanation (talk track)
-
-1) PDF → images via PyMuPDF (fast; respects max pages + latency budget).
-2) OCR via PaddleOCR; for digital PDFs, lightweight PyMuPDF text extraction can be used.
-3) Layout structuring + rules/fuzzy match for dealer/model; robust numeric parsing for HP and asset cost.
-4) Optional signature/stamp detection (YOLO if weights present), always returning strict JSON.
-5) Determinism: sorted dataset discovery + seeded sampling; evaluator-style checks for schema/latency/cost.
-
-## Final Round Execution Guide
-
-This section is the “one page” guide for the final round. The defaults are **CPU-only**, **deterministic**, and **offline-safe**.
-
-### Dataset setup
-
-- Place invoice PDFs under `data/pdfs/` (recursive folders supported)
-- Optional ground truth JSON under `data/labels/` (same stem as PDF)
-- See `data/README.md` for the official dataset layout and workflow
-
-Quick dataset validation (opens PDFs via PyMuPDF):
-
-```bash
-python dataset_preflight.py --invoices data/pdfs --labels data/labels
-```
-
-### Judge run (PASS/FAIL)
-
-Runs preflight + judge simulation in **fast** mode and prints a PASS/FAIL summary:
-
-```bash
-bash judge_run.sh
-```
-
-### Live demo (Streamlit)
-
-Launches Streamlit (includes the **Judge Demo** tab):
-
-```bash
-bash demo_live.sh
-```
-
-### Leaderboard preview
-
-After running `doc_ai_project/eval.py`, preview key metrics:
-
-```bash
-python leaderboard_preview.py --report doc_ai_project/outputs/eval_report.json
-```
-
-### Submission packaging
-
-Runs the evaluator-grade gate and builds `outputs/submission.zip`:
-
-```bash
-bash submission_pack.sh
-```
 
 Notes:
 - PaddleOCR stays disabled unless explicitly enabled with `--enable-paddleocr`.
