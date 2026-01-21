@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from dataclasses import replace
 
@@ -34,6 +34,31 @@ from utils.pdf import iter_pdf_to_images
 from utils.text import detect_language_bucket
 from validator import InvoiceFields, InvoiceOutput, PresenceBox
 from architecture_diagram import generate_architecture_png
+
+
+# Populated by CLI `main()` so wrappers can keep the requested
+# `run_image_pipeline(image_path, out_path)` / `run_pdf_pipeline(pdf_path, out_path)` signatures.
+_CLI_CONFIG: Optional[PipelineConfig] = None
+_CLI_DOC_ID: Optional[str] = None
+
+
+def _resolve_out_path(*, base_dir: Path, config: PipelineConfig, out_arg: str) -> Path:
+	output_dir = config.output_dir if Path(config.output_dir).is_absolute() else (base_dir / config.output_dir)
+	out_path_arg = Path(out_arg)
+	if out_path_arg.is_absolute():
+		out_path = out_path_arg
+	else:
+		# If user passed outputs/... then drop leading outputs
+		parts = list(out_path_arg.parts)
+		if parts and parts[0] == "outputs":
+			parts = parts[1:]
+		out_path = output_dir.joinpath(*parts) if parts else (output_dir / "result.json")
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	return out_path
+
+
+def _write_result_json(*, result: Dict, out_path: Path) -> None:
+	out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def run_pipeline(pdf_path: str, doc_id: str, config: PipelineConfig) -> Dict:
@@ -409,7 +434,7 @@ def run_pipeline(pdf_path: str, doc_id: str, config: PipelineConfig) -> Dict:
 		return _fallback_output(error=str(e))
 
 
-def run_image_pipeline(image_path: str, doc_id: str, config: PipelineConfig) -> Dict:
+def _run_image_pipeline_core(image_path: str, doc_id: str, config: PipelineConfig) -> Dict:
 	"""PNG-only pipeline entrypoint for jury evaluation.
 
 	- Always treats input as a single-page scanned document
@@ -491,20 +516,6 @@ def run_image_pipeline(image_path: str, doc_id: str, config: PipelineConfig) -> 
 		ocr_failures = 0
 		ocr_pages = []
 
-		# PNG runs: automatically enable PaddleOCR (offline-safe). Allow explicit opt-out.
-		disable_paddle_env = str(os.getenv("DOC_AI_DISABLE_PADDLEOCR", "0")).strip().lower() in {"1", "true", "yes"}
-		use_paddle = bool((not DOC_AI_FAST_MODE) and (not disable_paddle_env))
-		warmed = False
-		if use_paddle:
-			# Warm models once; if warmup fails, worker will return empty OCR and we'll fallback.
-			remaining = float(deadline - time.perf_counter())
-			warmed = warmup_ocr(
-				seed=int(getattr(config, "seed", 1337)),
-				engine_kwargs=None,
-				timeout_sec=min(8.0, max(1.5, remaining - 2.0)),
-			)
-			log_event(logger, "ocr_warmup", ok=bool(warmed))
-
 		engine_kwargs = {
 			"use_angle_cls": bool(getattr(config, "use_angle_cls", True)),
 			"langs": tuple(strategy.ocr_langs) if strategy.ocr_langs else tuple(getattr(config, "ocr_langs", ("en", "devanagari", "gujarati"))),
@@ -516,6 +527,28 @@ def run_image_pipeline(image_path: str, doc_id: str, config: PipelineConfig) -> 
 			"perspective_correct": bool(getattr(config, "ocr_perspective_correct", False)),
 			"upscale_if_low_res": bool(getattr(config, "ocr_upscale_if_low_res", True)),
 		}
+
+		# PNG runs: PaddleOCR is enabled only if explicitly allowed (jury-safe).
+		# Requirement: ensure PaddleOCR is used when DOC_AI_ENABLE_PADDLEOCR=1.
+		allow_paddle_env = str(os.getenv("DOC_AI_ENABLE_PADDLEOCR", "0")).strip().lower() in {"1", "true", "yes"}
+		allow_paddle_cfg = bool(getattr(config, "enable_paddleocr", False))
+		disable_paddle_env = str(os.getenv("DOC_AI_DISABLE_PADDLEOCR", "0")).strip().lower() in {"1", "true", "yes"}
+		use_paddle = bool((not DOC_AI_FAST_MODE) and (allow_paddle_env or allow_paddle_cfg) and (not disable_paddle_env))
+		warmed = False
+		if DOC_AI_FAST_MODE:
+			ocr_mode = "fast_mode_no_paddle"
+		elif not use_paddle:
+			ocr_mode = "no_paddle"
+		else:
+			ocr_mode = "paddleocr"
+			# Warm models once; if warmup fails, worker will return empty OCR and we'll fallback.
+			remaining = float(deadline - time.perf_counter())
+			warmed = warmup_ocr(
+				seed=int(getattr(config, "seed", 1337)),
+				engine_kwargs=engine_kwargs,
+				timeout_sec=min(8.0, max(1.5, remaining - 2.0)),
+			)
+			log_event(logger, "ocr_warmup", ok=bool(warmed))
 
 		# Primary: PaddleOCR
 		page = None
@@ -544,20 +577,26 @@ def run_image_pipeline(image_path: str, doc_id: str, config: PipelineConfig) -> 
 
 		# Fallback: Tesseract (if installed)
 		if (page is None) or (not getattr(page, "words", [])):
-			from ocr import tesseract_run_page
+			try:
+				from ocr import tesseract_run_page
 
-			fallback_page = tesseract_run_page(0, img, langs=list(engine_kwargs.get("langs") or ("en",)))
-			if getattr(fallback_page, "words", []):
-				page = fallback_page
-				ocr_fallback_used = True
-				ocr_mode = "tesseract"
-			else:
-				# Fully offline-safe: return empty OCR (still schema-valid output).
-				page = type("_", (), {"page_index": 0, "words": [], "texts": lambda self: []})()
-				if not use_paddle:
-					ocr_mode = "disabled_no_paddle"
+				fallback_page = tesseract_run_page(0, img, langs=list(engine_kwargs.get("langs") or ("en",)))
+				if getattr(fallback_page, "words", []):
+					page = fallback_page
+					ocr_fallback_used = True
+					ocr_mode = "tesseract"
 				else:
-					ocr_mode = "empty_after_fallback"
+					# Fully offline-safe: return empty OCR (still schema-valid output).
+					page = type("_", (), {"page_index": 0, "words": [], "texts": lambda self: []})()
+					if not use_paddle:
+						ocr_mode = "empty_no_paddle"
+					else:
+						ocr_mode = "empty_after_fallback"
+			except Exception as e:
+				ocr_fallback_used = True
+				log_event(logger, "ocr_fallback_unavailable", error=str(e)[:500])
+				page = type("_", (), {"page_index": 0, "words": [], "texts": lambda self: []})()
+				ocr_mode = "empty_fallback_unavailable"
 
 		ocr_pages.append(page)
 		ocr_sec = time.perf_counter() - t0
@@ -677,6 +716,31 @@ def run_image_pipeline(image_path: str, doc_id: str, config: PipelineConfig) -> 
 		return _fallback_output(error=str(e))
 
 
+def run_image_pipeline(image_path: str, out_path: str) -> Dict:
+	"""PNG → OCR → Layout → Extraction → Validation → JSON.
+
+	This wrapper exists to support jury-style execution with `--png`.
+	"""
+	base_dir = Path(__file__).resolve().parent
+	config = _CLI_CONFIG or PipelineConfig()
+	doc_id = _CLI_DOC_ID or Path(image_path).stem
+	result = _run_image_pipeline_core(image_path=image_path, doc_id=doc_id, config=config)
+	final_out_path = _resolve_out_path(base_dir=base_dir, config=config, out_arg=out_path)
+	_write_result_json(result=result, out_path=final_out_path)
+	return result
+
+
+def run_pdf_pipeline(pdf_path: str, out_path: str) -> Dict:
+	"""PDF pipeline wrapper that preserves the existing PDF flow."""
+	base_dir = Path(__file__).resolve().parent
+	config = _CLI_CONFIG or PipelineConfig()
+	doc_id = _CLI_DOC_ID or Path(pdf_path).stem
+	result = run_pipeline(pdf_path=pdf_path, doc_id=doc_id, config=config)
+	final_out_path = _resolve_out_path(base_dir=base_dir, config=config, out_arg=out_path)
+	_write_result_json(result=result, out_path=final_out_path)
+	return result
+
+
 def main() -> int:
 	p = argparse.ArgumentParser(description="DocAI Invoice Extractor")
 	g = p.add_mutually_exclusive_group(required=True)
@@ -723,51 +787,18 @@ def main() -> int:
 		max_pages=int(args.max_pages),
 		enable_paddleocr=bool(getattr(args, "enable_paddleocr", False)),
 	)
-	try:
-		if args.png:
-			result = run_image_pipeline(image_path=args.png, doc_id=doc_id, config=cfg)
-		else:
-			result = run_pipeline(pdf_path=args.pdf, doc_id=doc_id, config=cfg)
-	except BaseException as e:
-		# Never hard-crash without writing output JSON (evaluator/demo friendliness)
-		processing_time = float(round(0.0, 3))
-		fallback = {
-			"doc_id": str(doc_id),
-			"fields": {
-				"dealer_name": None,
-				"model_name": None,
-				"horse_power": None,
-				"asset_cost": None,
-				"signature": {"present": False, "bbox": []},
-				"stamp": {"present": False, "bbox": []},
-			},
-			"confidence": 0.0,
-			"review_required": True,
-			"processing_time_sec": processing_time,
-			"cost_estimate_usd": 0.0,
-			"cost_breakdown_usd": None,
-		}
-		try:
-			InvoiceOutput.model_validate(fallback, strict=True)
-		except Exception:
-			pass
-		print(f"[warn] run_pipeline failed for {doc_id}: {e}", file=sys.stderr)
-		result = fallback
+
+	# Expose CLI-derived context to the required wrapper signatures.
+	global _CLI_CONFIG, _CLI_DOC_ID
+	_CLI_CONFIG = cfg
+	_CLI_DOC_ID = doc_id
+
+	if args.png:
+		result = run_image_pipeline(args.png, args.out)
+	else:
+		result = run_pdf_pipeline(args.pdf, args.out)
 
 	output_dir = cfg.output_dir if Path(cfg.output_dir).is_absolute() else (base_dir / cfg.output_dir)
-
-	# Resolve --out consistently under output_dir (independent of cwd)
-	out_arg = Path(args.out)
-	if out_arg.is_absolute():
-		out_path = out_arg
-	else:
-		# If user passed outputs/... then drop leading outputs
-		parts = list(out_arg.parts)
-		if parts and parts[0] == "outputs":
-			parts = parts[1:]
-		out_path = output_dir.joinpath(*parts) if parts else (output_dir / "result.json")
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
 	# Optional artifacts (explicit opt-in only)
 	try:
